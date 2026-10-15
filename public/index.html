@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Zervo test page</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <img src="logo.svg" alt="Zervo logo" width="64" height="64">
+    <h1>It works!</h1>
+  </header>
+
+  <main>
+    <p>If this text is on a dark background with a colored title, <code>style.css</code> was served with the right Content-Type.</p>
+    <p>If you see a lightning bolt above, <code>logo.svg</code> was served too.</p>
+
+    <h2>Test links</h2>
+    <ul>
+      <li><a href="about.html">A second page</a>: should load normally</li>
+      <li><a href="missing.html">A missing page</a>: should give your 404</li>
+      <li><a href="about.html?from=index">A page with a query string</a>: should load about.html</li>
+    </ul>
+  </main>
+</body>
+</html>

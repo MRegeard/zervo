@@ -1,0 +1,32 @@
+body {
+  margin: 0;
+  padding: 2rem;
+  font-family: system-ui, sans-serif;
+  background: #1e1e2e;
+  color: #cdd6f4;
+  max-width: 40rem;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+h1 {
+  color: #f7a41d; /* Zig orange */
+}
+
+h2 {
+  color: #89b4fa;
+}
+
+a {
+  color: #a6e3a1;
+}
+
+code {
+  background: #313244;
+  padding: 0.1rem 0.3rem;
+  border-radius: 4px;
+}
