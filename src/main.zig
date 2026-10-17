@@ -1,92 +1,74 @@
 const std = @import("std");
-const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
+const Args = std.process.Args;
 const Io = std.Io;
+const File = Io.File;
+const http = std.http;
+const Status = http.Status;
+const Method = http.Method;
+const assert = std.debug.assert;
+const ext = @import("ext.zig");
+const Ext = ext.Ext;
 
 const port: u16 = 8000;
 const add_text: []const u8 = "127.0.0.1";
 
-const max_file_size = 10 * 1024 * 1024;
+const usage =
+    \\Usage: zervos [Optional] Path {./}
+    \\
+;
 
-pub const Ext = enum {
-    html,
-    css,
-    js,
-    json,
-    txt,
-    svg,
-    png,
-    jpg,
-    jpeg,
-    gif,
-    webp,
-    ico,
-    pdf,
-    other,
-
-    pub fn fromString(ext: []const u8) Ext {
-        const trim_ext = std.mem.trimStart(u8, ext, ".");
-        return std.meta.stringToEnum(Ext, trim_ext) orelse .other;
-    }
-
-    pub fn toMIME(self: Ext) []const u8 {
-        return switch (self) {
-            .html => "text/html; charset=utf-8",
-            .css => "text/css; charset=utf-8",
-            .js => "text/javascript; charset=utf-8",
-            .json => "application/json",
-            .txt => "text/plain; charset=utf-8",
-            .svg => "image/svg+xml",
-            .png => "image/png",
-            .jpg, .jpeg => "image/jpeg",
-            .gif => "image/gif",
-            .webp => "image/webp",
-            .ico => "image/x-icon",
-            .pdf => "application/pdf",
-            .other => "application/octet-stream",
-        };
-    }
-};
-
-const State = struct {
-    root_dir: []const u8 = undefined,
-};
-
-pub fn main(init: std.process.Init.Minimal) !void {
-    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var state: State = .{};
-
-    var args_it = try init.args.iterateAllocator(allocator);
+pub fn parseArgs(allocator: Allocator, args: Args) ![]const u8 {
+    var args_it = try args.iterateAllocator(allocator);
     _ = args_it.skip();
 
     if (args_it.next()) |path| {
-        state.root_dir = path;
+        if (args_it.next() != null) {
+            std.log.info("{s}", .{usage});
+            std.process.fatal("Only one command line argument `Path` supported.", .{});
+        }
+        return path;
     } else {
-        state.root_dir = "./";
+        return "./";
     }
+}
 
-    var threaded: Io.Threaded = .init_single_threaded;
-    const io: Io = threaded.io();
+const App = struct {
+    root_dir: []const u8,
+    log: *Io.Writer,
+    loop_allocator: Allocator,
+};
 
-    var file_read_buffer: [1024]u8 = undefined;
+pub fn main(init: std.process.Init) !void {
+    const allocator: Allocator = init.arena.allocator();
+    const io: Io = init.io;
 
-    var write_buf: [1024]u8 = undefined;
-    var stdout_writer = Io.File.stdout().writer(io, &write_buf);
-    const stdout: *Io.Writer = &stdout_writer.interface;
+    var loop_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer loop_arena.deinit();
+    const loop_allocator = loop_arena.allocator();
+
+    var log_buf: [1024]u8 = undefined;
+    var log_writer = Io.File.stdout().writer(io, &log_buf);
+    const log: *Io.Writer = &log_writer.interface;
+
+    const root_dir = try parseArgs(allocator, init.minimal.args);
 
     const address: Io.net.IpAddress = try .parse(add_text, port);
 
     var server = try address.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
 
-    var read_buf: [8192]u8 = undefined;
+    const app: App = .{
+        .root_dir = root_dir,
+        .log = log,
+        .loop_allocator = loop_allocator,
+    };
+
     var stream_write_buf: [1024]u8 = undefined;
+    var read_buf: [8192]u8 = undefined;
 
     while (true) {
-        _ = arena.reset(.retain_capacity);
+        _ = loop_arena.reset(.retain_capacity);
 
         var stream = try server.accept(io);
         defer stream.close(io);
@@ -97,54 +79,53 @@ pub fn main(init: std.process.Init.Minimal) !void {
         var stream_reader = stream.reader(io, &read_buf);
         const reader: *Io.Reader = &stream_reader.interface;
 
-        const line1 = std.mem.trim(u8, (try reader.takeDelimiter('\n')) orelse continue, "\r");
-        const first_line = FirstLine.parse(allocator, line1) catch {
-            try sendResponse(writer, "400 Bad Request", "text/html", "<h1>400 Bad Request</h1>");
-            continue;
+        handleConnection(io, app, writer, reader) catch |err| {
+            try app.log.print("ERROR: {s}\n", .{@errorName(err)});
         };
-
-        try stdoutHeader(stdout, reader, first_line);
-
-        if (first_line.method != .GET) {
-            try sendResponse(writer, "405 Method Not Allowed", "text/html", "<h1>405 Method Not Allowed</h1>");
-            continue;
-        }
-
-        const request_path = try fileRequest(allocator, state.root_dir, first_line.path);
-
-        // TODO: refactor this
-        if (std.mem.containsAtLeast(u8, request_path, 1, "/../")) {
-            try sendResponse(writer, "400 Bad Request", "text/html", "<h1>400 Bad Request</h1>");
-        }
-
-        const ext = std.mem.trim(u8, std.fs.path.extension(request_path), ".");
-        const ext_lower = try lowercaseAlloc(allocator, ext);
-        const mime = Ext.fromString(ext_lower).toMIME();
-
-        const file = Io.Dir.cwd().openFile(io, request_path, .{}) catch |err| switch (err) {
-            error.FileNotFound => {
-                try sendResponse(writer, "404 Not Found", "text/html", "<h1>404 Not Found</h1>");
-                continue;
-            },
-            else => {
-                try sendResponse(writer, "500 Internal Server Error", "text/html", "<h1>500 Internal Server Error</h1>");
-                continue;
-            },
-        };
-        defer file.close(io);
-
-        var f_reader = file.reader(io, &file_read_buffer);
-        const file_reader = &f_reader.interface;
-        const file_content = try file_reader.allocRemaining(allocator, .limited(max_file_size));
-
-        try sendResponse(writer, "200 OK", mime, file_content);
     }
+}
+
+pub fn handleConnection(io: Io, app: App, writer: *Io.Writer, reader: *Io.Reader) !void {
+    const line1 = std.mem.trim(u8, (try reader.takeDelimiter('\n')) orelse return, "\r");
+    const first_line = FirstLine.parse(app.loop_allocator, line1) catch {
+        try sendResponse(writer, .bad_request);
+        return;
+    };
+
+    try stdoutHeader(app.log, reader, first_line);
+
+    if (first_line.method != .GET) {
+        try sendResponse(writer, .method_not_allowed);
+        return;
+    }
+    if (!isSafePath(first_line.path)) {
+        try sendResponse(writer, .bad_request);
+        return;
+    }
+
+    const request_path = try fileRequest(app.loop_allocator, app.root_dir, first_line.path);
+
+    const mime = Ext.fromPath(request_path).toMIME();
+
+    const file = Io.Dir.cwd().openFile(io, request_path, .{ .allow_directory = false }) catch |err| switch (err) {
+        error.FileNotFound, error.IsDir => {
+            try sendResponse(writer, .not_found);
+            return;
+        },
+        else => {
+            try sendResponse(writer, .internal_server_error);
+            return;
+        },
+    };
+    defer file.close(io);
+
+    try sendResponseFile(io, writer, &file, mime);
 }
 
 const FirstLine = struct {
     pub const Error = error{ParseError} || Allocator.Error;
 
-    method: std.http.Method,
+    method: Method,
     path: []const u8,
     version: std.http.Version,
 
@@ -162,8 +143,34 @@ const FirstLine = struct {
     }
 };
 
-pub fn sendResponse(writer: *Io.Writer, status: []const u8, content_type: []const u8, body: []const u8) !void {
-    try writer.print("HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ status, content_type, body.len, body });
+pub fn sendResponseFile(io: Io, writer: *Io.Writer, file: *const File, content_type: []const u8) !void {
+    var buf: [4096]u8 = undefined;
+    var file_reader = file.reader(io, &buf);
+    const file_size = (try file.stat(io)).size;
+
+    const to_print =
+        "HTTP/1.1 200 OK\r\n" ++
+        "Content-type: {s}\r\n" ++
+        "Content-length: {d}\r\n" ++
+        "Connection: close\r\n" ++
+        "\r\n";
+    try writer.print(to_print, .{ content_type, file_size });
+    const bytes_send = try writer.sendFileReadingAll(&file_reader, .limited64(file_size));
+    assert(bytes_send == file_size);
+    try writer.flush();
+}
+
+pub fn sendResponse(writer: *Io.Writer, status: Status) !void {
+    const status_text = status.phrase().?;
+    const status_int = @intFromEnum(status);
+    const to_print =
+        "HTTP/1.1 {d} {s}\r\n" ++
+        "Content-type: text/html\r\n" ++
+        "Content-length: {d}\r\n" ++
+        "Connection: close\r\n" ++
+        "\r\n" ++
+        "<h1>{d} {s}</h1>";
+    try writer.print(to_print, .{ status_int, status_text, status_text.len + 13, status_int, status_text });
     try writer.flush();
 }
 
@@ -179,16 +186,14 @@ pub fn fileRequest(allocator: Allocator, root_path: []const u8, path: []const u8
     return try std.fs.path.join(allocator, &.{ root_path, strip_path });
 }
 
-pub fn lowercaseAlloc(allocator: Allocator, str: []const u8) ![]const u8 {
-    const lower = try allocator.alloc(u8, str.len);
-
-    for (0..str.len) |i| {
-        switch (str[i]) {
-            'A'...'Z' => lower[i] = str[i] + 32,
-            else => lower[i] = str[i],
+pub fn isSafePath(path: []const u8) bool {
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |segment| {
+        if (std.mem.eql(u8, segment, "..")) {
+            return false;
         }
     }
-    return lower;
+    return true;
 }
 
 pub fn stdoutHeader(writer: *Io.Writer, reader: *Io.Reader, first_line: FirstLine) !void {
